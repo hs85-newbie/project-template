@@ -12,10 +12,12 @@ on:
         default: "20"
         type: string
   repository_dispatch:
-    types: [claude-task]
+    types: [claude-task, claude-approve]
 
 jobs:
-  claude:
+  # ── 작업 실행 (claude-task) ──
+  execute:
+    if: github.event_name != 'repository_dispatch' || github.event.client_payload.action != 'approve'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -57,55 +59,125 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          allowed_tools: "Bash(git *),Bash(gh *),Bash(npm *),Bash(npx *)"
           prompt: |
             작업: ${{ inputs.task || github.event.client_payload.task }}
 
             지시사항:
             - 위 작업을 수행하고 코드를 수정하세요.
-            - 수정 완료 후 새 브랜치를 만들고 커밋한 뒤, gh pr create로 PR을 생성하세요.
-            - PR 대상 브랜치: ${{ github.event.client_payload.branch || 'main' }}
-            - 커밋 메시지와 PR 제목은 한국어로 작성하세요.
+            - 수정 완료 후 새 브랜치를 생성하고 커밋 + push 하세요.
+            - 브랜치명: claude/${{ github.event.client_payload.issue_id || 'manual' }}
+            - 대상 브랜치: ${{ github.event.client_payload.branch || 'main' }}
+            - 커밋 메시지는 한국어로 작성하세요.
+            - PR은 생성하지 마세요. 브랜치 push만 하세요.
           claude_args: "--max-turns ${{ inputs.max_turns || github.event.client_payload.max_turns || '20' }}"
 
-      # Paperclip 상태 업데이트 (repository_dispatch에서만)
-      - name: Paperclip 이슈 상태 → in_review + 결과 코멘트
-        if: always() && github.event_name == 'repository_dispatch' && github.event.client_payload.issue_uuid
+      # 수정 내용 보고서를 Paperclip에 코멘트로 남김
+      - name: Paperclip 보고 (in_review + diff 코멘트)
+        if: always() && github.event_name == 'repository_dispatch'
         env:
           PAPERCLIP_URL: https://paperclip-production-7ed4.up.railway.app
-          PAPERCLIP_COMPANY_ID: b80076db-214e-44a4-b016-427d7f0e3044
           PAPERCLIP_API_KEY: ${{ secrets.PAPERCLIP_API_KEY }}
           ISSUE_UUID: ${{ github.event.client_payload.issue_uuid }}
           ISSUE_ID: ${{ github.event.client_payload.issue_id }}
+          BRANCH: ${{ github.event.client_payload.branch || 'main' }}
           JOB_STATUS: ${{ job.status }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_TOKEN: ${{ secrets.GLOBAL_SETTINGS_TOKEN }}
         run: |
-          if [ "$JOB_STATUS" = "success" ]; then
-            # PR이 생성되었는지 확인
-            PR_URL=$(gh pr list --state open --limit 1 --json url --jq '.[0].url' 2>/dev/null || echo "")
+          WORK_BRANCH="claude/${ISSUE_ID}"
 
-            if [ -n "$PR_URL" ]; then
-              STATUS="in_review"
-              COMMENT="✅ 작업 완료 — PR 생성됨: ${PR_URL}\n\n🔗 Actions 로그: ${RUN_URL}"
-            else
-              STATUS="in_review"
-              COMMENT="✅ 작업 완료 (PR 미생성 — 코드 변경 불필요하거나 직접 커밋됨)\n\n🔗 Actions 로그: ${RUN_URL}"
-            fi
+          if [ "$JOB_STATUS" = "success" ]; then
+            # 변경 사항 요약
+            DIFF_STAT=$(git diff --stat "origin/${BRANCH}...origin/${WORK_BRANCH}" 2>/dev/null || echo "diff 확인 불가")
+            CHANGED_FILES=$(git diff --name-only "origin/${BRANCH}...origin/${WORK_BRANCH}" 2>/dev/null | head -20 || echo "")
+            COMMIT_LOG=$(git log --oneline "origin/${BRANCH}..origin/${WORK_BRANCH}" 2>/dev/null | head -10 || echo "")
+
+            STATUS="in_review"
+            COMMENT="✅ 코드 수정 완료 — 리뷰 대기 중\n\n"
+            COMMENT="${COMMENT}📌 브랜치: \`${WORK_BRANCH}\` → \`${BRANCH}\`\n\n"
+            COMMENT="${COMMENT}📝 커밋:\n\`\`\`\n${COMMIT_LOG}\n\`\`\`\n\n"
+            COMMENT="${COMMENT}📂 변경 파일:\n\`\`\`\n${CHANGED_FILES}\n\`\`\`\n\n"
+            COMMENT="${COMMENT}🔗 Actions 로그: ${RUN_URL}\n\n"
+            COMMENT="${COMMENT}👉 승인하려면 이 이슈에 \`승인\` 코멘트를 남겨주세요."
           else
             STATUS="todo"
             COMMENT="❌ 작업 실패 — 재시도 필요\n\n🔗 Actions 로그: ${RUN_URL}"
           fi
 
           # 상태 업데이트
-          curl -sf -X PATCH "${PAPERCLIP_URL}/api/companies/${PAPERCLIP_COMPANY_ID}/issues/${ISSUE_UUID}" \
+          curl -sf -X PATCH "${PAPERCLIP_URL}/api/issues/${ISSUE_UUID}" \
             -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
             -H "Content-Type: application/json" \
             -d "{\"status\":\"${STATUS}\"}" > /dev/null 2>&1 || true
 
-          # 코멘트 추가
-          curl -sf -X POST "${PAPERCLIP_URL}/api/companies/${PAPERCLIP_COMPANY_ID}/issues/${ISSUE_UUID}/comments" \
+          # 코멘트 (줄바꿈 처리)
+          COMMENT_ESCAPED=$(echo -e "$COMMENT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+          curl -sf -X POST "${PAPERCLIP_URL}/api/issues/${ISSUE_UUID}/comments" \
             -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
             -H "Content-Type: application/json" \
-            -d "{\"body\":\"${COMMENT}\"}" > /dev/null 2>&1 || true
+            -d "{\"body\":${COMMENT_ESCAPED}}" > /dev/null 2>&1 || true
 
           echo "Paperclip ${ISSUE_ID}: ${STATUS}"
+
+  # ── 승인 → PR 생성 + 머지 (claude-approve) ──
+  approve:
+    if: github.event_name == 'repository_dispatch' && github.event.client_payload.action == 'approve'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.branch || 'main' }}
+          fetch-depth: 0
+
+      - name: PR 생성 및 머지
+        env:
+          PAPERCLIP_URL: https://paperclip-production-7ed4.up.railway.app
+          PAPERCLIP_API_KEY: ${{ secrets.PAPERCLIP_API_KEY }}
+          ISSUE_UUID: ${{ github.event.client_payload.issue_uuid }}
+          ISSUE_ID: ${{ github.event.client_payload.issue_id }}
+          ISSUE_TITLE: ${{ github.event.client_payload.issue_title }}
+          BRANCH: ${{ github.event.client_payload.branch || 'main' }}
+          GH_TOKEN: ${{ secrets.GLOBAL_SETTINGS_TOKEN }}
+        run: |
+          WORK_BRANCH="claude/${ISSUE_ID}"
+
+          # PR 생성
+          PR_URL=$(gh pr create \
+            --base "$BRANCH" \
+            --head "$WORK_BRANCH" \
+            --title "[${ISSUE_ID}] ${ISSUE_TITLE}" \
+            --body "Paperclip 이슈 ${ISSUE_ID} 승인됨. 자동 생성된 PR." \
+            2>&1) || true
+
+          if echo "$PR_URL" | grep -q "github.com"; then
+            echo "PR 생성됨: $PR_URL"
+
+            # PR 자동 머지
+            PR_NUM=$(echo "$PR_URL" | grep -oP '\d+$')
+            gh pr merge "$PR_NUM" --merge --delete-branch || true
+
+            # Paperclip → done
+            curl -sf -X PATCH "${PAPERCLIP_URL}/api/issues/${ISSUE_UUID}" \
+              -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d '{"status":"done"}' > /dev/null 2>&1 || true
+
+            curl -sf -X POST "${PAPERCLIP_URL}/api/issues/${ISSUE_UUID}/comments" \
+              -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\":\"🎉 PR 머지 완료: ${PR_URL}\"}" > /dev/null 2>&1 || true
+
+            echo "✅ PR 머지 + Paperclip done"
+          else
+            echo "⚠️ PR 생성 실패: $PR_URL"
+
+            curl -sf -X POST "${PAPERCLIP_URL}/api/issues/${ISSUE_UUID}/comments" \
+              -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\":\"⚠️ PR 생성 실패 — 브랜치 ${WORK_BRANCH} 확인 필요\"}" > /dev/null 2>&1 || true
+          fi
