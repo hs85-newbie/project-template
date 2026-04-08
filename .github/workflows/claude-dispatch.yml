@@ -54,5 +54,13 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: ${{ inputs.task || github.event.client_payload.task }}
+          allowed_tools: "Bash(git *),Bash(gh *),Bash(npm *),Bash(npx *)"
+          prompt: |
+            작업: ${{ inputs.task || github.event.client_payload.task }}
+
+            지시사항:
+            - 위 작업을 수행하고 코드를 수정하세요.
+            - 수정 완료 후 새 브랜치를 만들고 커밋한 뒤, gh pr create로 PR을 생성하세요.
+            - PR 대상 브랜치: ${{ github.event.client_payload.branch || 'main' }}
+            - 커밋 메시지와 PR 제목은 한국어로 작성하세요.
           claude_args: "--max-turns ${{ inputs.max_turns || github.event.client_payload.max_turns || '20' }}"
