@@ -51,7 +51,10 @@ jobs:
             git clone https://github.com/garrytan/gstack.git ~/gstack
           fi
           cd ~/gstack && ./setup --host claude
-      - uses: anthropics/claude-code-action@v1
+
+      - name: Claude Code 실행
+        id: claude
+        uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_tools: "Bash(git *),Bash(gh *),Bash(npm *),Bash(npx *)"
@@ -64,3 +67,45 @@ jobs:
             - PR 대상 브랜치: ${{ github.event.client_payload.branch || 'main' }}
             - 커밋 메시지와 PR 제목은 한국어로 작성하세요.
           claude_args: "--max-turns ${{ inputs.max_turns || github.event.client_payload.max_turns || '20' }}"
+
+      # Paperclip 상태 업데이트 (repository_dispatch에서만)
+      - name: Paperclip 이슈 상태 → in_review + 결과 코멘트
+        if: always() && github.event_name == 'repository_dispatch' && github.event.client_payload.issue_uuid
+        env:
+          PAPERCLIP_URL: https://paperclip-production-7ed4.up.railway.app
+          PAPERCLIP_COMPANY_ID: b80076db-214e-44a4-b016-427d7f0e3044
+          PAPERCLIP_API_KEY: ${{ secrets.PAPERCLIP_API_KEY }}
+          ISSUE_UUID: ${{ github.event.client_payload.issue_uuid }}
+          ISSUE_ID: ${{ github.event.client_payload.issue_id }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$JOB_STATUS" = "success" ]; then
+            # PR이 생성되었는지 확인
+            PR_URL=$(gh pr list --state open --limit 1 --json url --jq '.[0].url' 2>/dev/null || echo "")
+
+            if [ -n "$PR_URL" ]; then
+              STATUS="in_review"
+              COMMENT="✅ 작업 완료 — PR 생성됨: ${PR_URL}\n\n🔗 Actions 로그: ${RUN_URL}"
+            else
+              STATUS="in_review"
+              COMMENT="✅ 작업 완료 (PR 미생성 — 코드 변경 불필요하거나 직접 커밋됨)\n\n🔗 Actions 로그: ${RUN_URL}"
+            fi
+          else
+            STATUS="todo"
+            COMMENT="❌ 작업 실패 — 재시도 필요\n\n🔗 Actions 로그: ${RUN_URL}"
+          fi
+
+          # 상태 업데이트
+          curl -sf -X PATCH "${PAPERCLIP_URL}/api/companies/${PAPERCLIP_COMPANY_ID}/issues/${ISSUE_UUID}" \
+            -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\":\"${STATUS}\"}" > /dev/null 2>&1 || true
+
+          # 코멘트 추가
+          curl -sf -X POST "${PAPERCLIP_URL}/api/companies/${PAPERCLIP_COMPANY_ID}/issues/${ISSUE_UUID}/comments" \
+            -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"body\":\"${COMMENT}\"}" > /dev/null 2>&1 || true
+
+          echo "Paperclip ${ISSUE_ID}: ${STATUS}"
