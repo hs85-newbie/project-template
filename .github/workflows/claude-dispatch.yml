@@ -395,6 +395,8 @@ jobs:
                       echo "⚠️ Merge 실패 (${attempt}/3) — rebase 시도"
                       git fetch origin "$BRANCH" 2>/dev/null
                       git checkout "$WORK_BRANCH" 2>/dev/null
+                      # WHY: .gitignore 수정 잔재 등 unstaged changes가 rebase를 막음 (HSD-330 사고)
+                      git stash 2>/dev/null || true
                       if git rebase "origin/${BRANCH}" 2>&1; then
                         git push origin "$WORK_BRANCH" --force-with-lease 2>&1 || true
                         sleep 3
