@@ -54,6 +54,10 @@ jobs:
           fi
           cd ~/gstack && ./setup --host claude
 
+      # WHY: Claude가 TypeScript 컴파일/린트 실행 시 node_modules가 없으면 실패 (HSD-317)
+      - name: 의존성 설치
+        run: npm install
+
       # WHY: 분석 작업(50턴)과 코드 수정(30턴)의 필요 턴 수가 다름
       # 추가: 작업 유형/카테고리에 따라 모델도 분기 (opus/sonnet/haiku)
       - name: 작업 유형 판단
@@ -87,10 +91,11 @@ jobs:
             echo "작업 유형: 코드 수정 [정리] (haiku, 30턴)"
           else
             # 일반 코드 수정: sonnet (가성비)
+            # WHY: 30턴은 [기능] 등 복잡한 작업에서 부족 (HSD-344 사례) → 45턴
             echo "type=code" >> $GITHUB_OUTPUT
-            echo "max_turns=30" >> $GITHUB_OUTPUT
+            echo "max_turns=45" >> $GITHUB_OUTPUT
             echo "model=claude-sonnet-4-6" >> $GITHUB_OUTPUT
-            echo "작업 유형: 코드 수정 [${CATEGORY:-일반}] (sonnet, 30턴)"
+            echo "작업 유형: 코드 수정 [${CATEGORY:-일반}] (sonnet, 45턴)"
           fi
 
       # WHY: task_type에 따라 분석/코드 수정 프롬프트 분기 — 토큰 50% 절약
