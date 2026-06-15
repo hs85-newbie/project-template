@@ -8,16 +8,14 @@ on:
         required: true
         type: string
       max_turns:
-        description: "최대 실행 횟수 (기본: 20)"
-        default: "20"
+        description: "최대 실행 횟수 (기본: 자동 판단)"
+        default: ""
         type: string
   repository_dispatch:
-    types: [claude-task, claude-approve]
+    types: [claude-task]
 
 jobs:
-  # ── 작업 실행 (claude-task) ──
   execute:
-    if: github.event_name != 'repository_dispatch' || github.event.client_payload.action != 'approve'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -54,19 +52,17 @@ jobs:
           fi
           cd ~/gstack && ./setup --host claude
 
-      # WHY: Claude가 TypeScript 컴파일/린트 실행 시 node_modules가 없으면 실패 (HSD-317)
+      # WHY: Claude가 TypeScript 컴파일/린트 실행 시 node_modules가 없으면 실패
       - name: 의존성 설치
         run: npm install
 
-      # WHY: 분석 작업(50턴)과 코드 수정(30턴)의 필요 턴 수가 다름
-      # 추가: 작업 유형/카테고리에 따라 모델도 분기 (opus/sonnet/haiku)
+      # WHY: 분석 작업과 코드 수정의 필요 턴 수/모델이 다름 → 작업 유형으로 분기
       - name: 작업 유형 판단
         id: task_type
         env:
           TASK: ${{ inputs.task || github.event.client_payload.task }}
         run: |
           # WHY: TASK를 env로 받아 bash 특수문자(backtick 등) 안전 처리
-          # 2026-04-13 HSD-313: Railway 에러 로그의 backtick이 bash 명령 치환으로 해석되어 step 실패
           TITLE_ONLY=$(echo "$TASK" | sed 's/\. 상세:.*$//')
           DESC_ONLY=$(echo "$TASK" | grep -oP '상세: \K.*' || echo "")
 
@@ -74,31 +70,26 @@ jobs:
           echo "$TITLE_ONLY" | grep -qE "점검|분석|제안|검토" && IS_ANALYSIS=true
           echo "$DESC_ONLY" | grep -qE "원인 분석|계획 수립|보고|점검|분석 후" && IS_ANALYSIS=true
 
-          # 카테고리 추출 (코드 수정 작업의 첫 번째 [카테고리])
           CATEGORY=$(echo "$TITLE_ONLY" | grep -oP '\[\K[^\]]+' | head -1 || echo "")
 
           if [ "$IS_ANALYSIS" = true ]; then
-            # 분석: 깊은 추론 필요 → opus
             echo "type=analysis" >> $GITHUB_OUTPUT
             echo "max_turns=50" >> $GITHUB_OUTPUT
-            echo "model=claude-opus-4-6" >> $GITHUB_OUTPUT
+            echo "model=claude-opus-4-8" >> $GITHUB_OUTPUT
             echo "작업 유형: 분석 (opus, 50턴)"
           elif [ "$CATEGORY" = "정리" ]; then
-            # 단순 정리: 패턴 치환 — haiku로 비용 1/10
             echo "type=code" >> $GITHUB_OUTPUT
             echo "max_turns=30" >> $GITHUB_OUTPUT
             echo "model=claude-haiku-4-5" >> $GITHUB_OUTPUT
             echo "작업 유형: 코드 수정 [정리] (haiku, 30턴)"
           else
-            # 일반 코드 수정: sonnet (가성비)
-            # WHY: 30턴은 [기능] 등 복잡한 작업에서 부족 (HSD-344 사례) → 45턴
             echo "type=code" >> $GITHUB_OUTPUT
             echo "max_turns=45" >> $GITHUB_OUTPUT
             echo "model=claude-sonnet-4-6" >> $GITHUB_OUTPUT
             echo "작업 유형: 코드 수정 [${CATEGORY:-일반}] (sonnet, 45턴)"
           fi
 
-      # WHY: task_type에 따라 분석/코드 수정 프롬프트 분기 — 토큰 50% 절약
+      # WHY: task_type에 따라 분석/코드 수정 프롬프트 분기 — 토큰 절약
       - name: 프롬프트 생성
         id: prompt
         env:
@@ -110,26 +101,12 @@ jobs:
             cat > /tmp/prompt.txt <<'PROMPT_END'
           작업: __TASK__
 
-          이슈 ID: __ISSUE_ID__
+          작업 ID: __ISSUE_ID__
 
           프로젝트를 분석하고 결과를 docs/ANALYSIS-__ISSUE_ID__.md 파일로 작성하세요.
           - 파일 구성: 현황 요약, 상세 분석, 마지막에 "후속 작업 목록" 섹션
           - 코드 수정 금지. 분석 파일만 생성.
-          - "후속 작업 목록"은 반드시 다음 형식:
-
-          ## 후속 작업 목록
-          ### P0 — Critical
-          - [ ] **[카테고리] 작업 제목**
-            - 파일: `경로/파일명`
-            - 설명: 구체적 설명
-          ### P1 — High
-          - [ ] **[카테고리] 작업 제목**
-            - 파일: `경로/파일명`
-            - 설명: 구체적 설명
-          ### P2 — Medium
-          - [ ] **[카테고리] 작업 제목**
-            - 파일: `경로/파일명`
-            - 설명: 구체적 설명
+          - "후속 작업 목록"은 P0/P1/P2 우선순위로 `- [ ] **[카테고리] 제목**` 형식 사용.
 
           ⚠️ git 명령(checkout, add, commit, push) 금지. 파일 생성만.
           PROMPT_END
@@ -137,10 +114,9 @@ jobs:
             cat > /tmp/prompt.txt <<'PROMPT_END'
           작업: __TASK__
 
-          이슈 ID: __ISSUE_ID__
+          작업 ID: __ISSUE_ID__
 
-          이슈 description의 [카테고리] 제목과 파일/설명만 보고 코드를 수정하세요.
-          docs/ANALYSIS-*.md 파일은 읽지 마세요 (token 절약).
+          요구사항의 [카테고리] 제목과 파일/설명만 보고 코드를 수정하세요.
           여러 항목을 한 번에 수정하지 마세요. 1개 항목만 처리.
 
           ⚠️ git 명령(checkout, add, commit, push) 금지. 파일 수정만.
@@ -172,29 +148,11 @@ jobs:
           prompt: ${{ steps.prompt.outputs.prompt }}
           claude_args: "--max-turns ${{ inputs.max_turns || github.event.client_payload.max_turns || steps.task_type.outputs.max_turns }} --model ${{ steps.task_type.outputs.model }} --dangerously-skip-permissions"
 
-      # WHY: Claude 실패 종류를 분류 — max_turns/token_limit 같은 재시도 무의미 에러는 in_review로
-      - name: Claude 결과 분류
-        id: claude_result
-        run: |
-          OUTCOME="${{ steps.claude.outcome }}"
-          echo "outcome=${OUTCOME}" >> $GITHUB_OUTPUT
-
-          if [ "$OUTCOME" = "success" ]; then
-            echo "claude_status=success" >> $GITHUB_OUTPUT
-            echo "✅ Claude 정상 완료"
-          else
-            # claude-code-action의 종료 사유 확인 (Annotation 또는 stderr 기반)
-            # max_turns / context_limit 같은 결정적 실패는 retry 무의미
-            echo "claude_status=failed" >> $GITHUB_OUTPUT
-            echo "⚠️ Claude 실패 — 변경사항이 있으면 push 시도, 없으면 in_review"
-          fi
-
-      # WHY: Claude에게 git push를 위임하면 max_turns 초과/권한 문제로 실패 반복 (HSD-9, HSD-13)
+      # WHY: Claude에게 git push를 위임하면 max_turns 초과/권한 문제로 실패 반복
       - name: 변경사항 감지
         id: changes
         run: |
-          # WHY: .claude-global은 워크플로우가 별도 checkout한 서브레포 — 변경사항으로 잡히면 false positive
-          # 2026-04-09 HSD-299/300/309/312 무한 재시도 사고 원인이었음
+          # WHY: .claude-global은 워크플로우가 별도 checkout한 서브레포 — false positive 방지
           CHANGES=$(git status --porcelain | grep -v '^?? \.claude-global/$' || true)
           if [ -n "$CHANGES" ]; then
             echo "has_changes=true" >> $GITHUB_OUTPUT
@@ -213,7 +171,8 @@ jobs:
           TASK: ${{ inputs.task || github.event.client_payload.task }}
           GH_TOKEN: ${{ secrets.GLOBAL_SETTINGS_TOKEN }}
         run: |
-          WORK_BRANCH="claude/${ISSUE_ID}"
+          WORK_BRANCH="claude/${ISSUE_ID}-$(date +%Y%m%d-%H%M%S)"
+          echo "work_branch=${WORK_BRANCH}" >> $GITHUB_OUTPUT
           COMMIT_MSG=$(echo "$TASK" | sed 's/\. 상세:.*$//' | head -c 72)
 
           # WHY: actions/checkout 토큰은 checkout step에서만 유효, push용 별도 설정 필요
@@ -227,8 +186,6 @@ jobs:
           git add -A
           git reset HEAD .gitignore
 
-          # WHY: commit 실패(no changes 등) 시 push_success=false 명시 후 정상 종료
-          # 2026-04-09 사고: commit 실패로 step이 죽어서 output 빈값 → push 실패 분기 false positive
           if ! git commit -m "${COMMIT_MSG}" 2>&1; then
             echo "push_success=false" >> $GITHUB_OUTPUT
             echo "❌ commit 실패 — 변경사항 없음 추정"
@@ -249,370 +206,30 @@ jobs:
           echo "❌ Push 3회 실패"
           exit 1
 
-      # 수정 내용 보고서를 Paperclip에 코멘트로 남김
-      - name: Paperclip 보고 + 분석 작업 자동 머지
-        if: always() && github.event_name == 'repository_dispatch'
+      # WHY: 머지는 사람 확인 게이트 — Claude는 PR 생성까지만 수행 (CLAUDE.md 자율성 경계)
+      - name: PR 생성
+        if: steps.changes.outputs.has_changes == 'true' && steps.git_push.outputs.push_success == 'true'
         env:
-          PAPERCLIP_URL: https://paperclip-production-7ed4.up.railway.app
-          PAPERCLIP_API_KEY: ${{ secrets.PAPERCLIP_API_KEY }}
-          ISSUE_UUID: ${{ github.event.client_payload.issue_uuid }}
-          ISSUE_ID: ${{ github.event.client_payload.issue_id }}
-          TASK: ${{ github.event.client_payload.task }}
+          ISSUE_ID: ${{ github.event.client_payload.issue_id || 'manual' }}
           BRANCH: ${{ github.event.client_payload.branch || 'main' }}
-          TASK_TYPE: ${{ steps.task_type.outputs.type }}
-          CLAUDE_STATUS: ${{ steps.claude_result.outputs.claude_status }}
-          HAS_CHANGES: ${{ steps.changes.outputs.has_changes }}
-          PUSH_SUCCESS: ${{ steps.git_push.outputs.push_success }}
+          TASK: ${{ inputs.task || github.event.client_payload.task }}
+          WORK_BRANCH: ${{ steps.git_push.outputs.work_branch }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GH_TOKEN: ${{ secrets.GLOBAL_SETTINGS_TOKEN }}
         run: |
-          WORK_BRANCH="claude/${ISSUE_ID}"
-
-          # WHY: task_type step에서 이미 판단했으므로 중복 로직 제거
-          IS_ANALYSIS=$( [ "$TASK_TYPE" = "analysis" ] && echo true || echo false )
-
-          if [ "$HAS_CHANGES" = "true" ] && [ "$PUSH_SUCCESS" = "true" ]; then
-            git fetch origin 2>/dev/null || true
-            DIFF_STAT=$(git diff --stat "origin/${BRANCH}...origin/${WORK_BRANCH}" 2>/dev/null || echo "diff 확인 불가")
-            CHANGED_FILES=$(git diff --name-only "origin/${BRANCH}...origin/${WORK_BRANCH}" 2>/dev/null | head -20 || echo "")
-            COMMIT_LOG=$(git log --oneline "origin/${BRANCH}..origin/${WORK_BRANCH}" 2>/dev/null | head -10 || echo "")
-
-            if [ "$IS_ANALYSIS" = true ]; then
-              # 분석 작업 → 자동 PR 생성 + 머지 + done
-              PR_URL=$(gh pr create \
-                --base "$BRANCH" \
-                --head "$WORK_BRANCH" \
-                --title "[${ISSUE_ID}] 분석 보고서" \
-                --body "분석 결과 docs/ANALYSIS-${ISSUE_ID}.md 자동 생성" \
-                2>&1) || true
-
-              if echo "$PR_URL" | grep -q "github.com"; then
-                PR_NUM=$(echo "$PR_URL" | grep -oP '\d+$')
-                gh pr merge "$PR_NUM" --merge --delete-branch 2>/dev/null || true
-
-                # ANALYSIS 파일에서 항목 추출 → sub-이슈 자동 생성
-                git checkout "$BRANCH" 2>/dev/null && git pull origin "$BRANCH" 2>/dev/null || true
-                ANALYSIS_FILE="docs/ANALYSIS-${ISSUE_ID}.md"
-                SUB_ITEMS=""
-                SUB_COUNT=0
-                if [ -f "$ANALYSIS_FILE" ]; then
-                  # C안 패턴: "- [ ] **[카테고리] 제목**" 추출
-                  SUB_ITEMS=$(grep -P '^\s*-\s*\[\s*\]\s*\*\*' "$ANALYSIS_FILE" | head -15 || echo "")
-                  SUB_COUNT=$(echo "$SUB_ITEMS" | grep -c '\*\*' || echo 0)
-                fi
-
-                REPO_BRANCH_TAG="[$(echo "${{ github.repository }}" | cut -d/ -f2):${BRANCH}]"
-
-                if [ "$SUB_COUNT" -gt 0 ]; then
-                  echo "📋 ANALYSIS에서 ${SUB_COUNT}개 항목 발견 — sub-이슈 생성"
-
-                  # WHY: 멱등성 — 같은 parent 하위 기존 이슈 제목 목록 조회
-                  EXISTING_TITLES=$(curl -sf "${PAPERCLIP_URL}/api/companies/b80076db-214e-44a4-b016-427d7f0e3044/issues" \
-                    -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" 2>/dev/null \
-                    | jq -r "[.[] | select(.parentId == \"${ISSUE_UUID}\")] | .[].title" 2>/dev/null || echo "")
-
-                  IDX=1
-                  echo "$SUB_ITEMS" | while IFS= read -r item; do
-                    # "- [ ] **[보안] subtitle-projects PATCH 소유권 검증 추가**" → "[보안] subtitle-projects PATCH 소유권 검증 추가"
-                    ITEM_CLEAN=$(echo "$item" | sed 's/^\s*-\s*\[\s*\]\s*\*\*//' | sed 's/\*\*\s*$//' | sed 's/^\s*//' | head -c 120)
-                    if [ -n "$ITEM_CLEAN" ]; then
-                      SUB_TITLE="${REPO_BRANCH_TAG} ${ITEM_CLEAN}"
-
-                      # 중복 차단
-                      if echo "$EXISTING_TITLES" | grep -qF "$SUB_TITLE"; then
-                        echo "  ⏭ Sub-${IDX}: 중복 — 스킵 (${ITEM_CLEAN})"
-                        IDX=$((IDX + 1))
-                        continue
-                      fi
-
-                      # 해당 항목의 다음 2줄(파일, 설명)도 추출
-                      LINE_NUM=$(grep -n "$(echo "$item" | head -c 50)" "$ANALYSIS_FILE" | head -1 | cut -d: -f1)
-                      SUB_DETAIL=""
-                      if [ -n "$LINE_NUM" ]; then
-                        SUB_DETAIL=$(sed -n "$((LINE_NUM+1)),$((LINE_NUM+2))p" "$ANALYSIS_FILE" | sed 's/^\s*-\s*//' | tr '\n' ' ')
-                      fi
-
-                      SUB_DESC="상위 이슈: ${ISSUE_ID}\n참조: ${ANALYSIS_FILE}\n\n${ITEM_CLEAN}\n${SUB_DETAIL}"
-                      SUB_DESC_JSON=$(echo -e "$SUB_DESC" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null || echo "\"\"")
-
-                      curl -sf -X POST "${PAPERCLIP_URL}/api/companies/b80076db-214e-44a4-b016-427d7f0e3044/issues" \
-                        -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
-                        -H "Content-Type: application/json" \
-                        -d "{\"title\":\"${SUB_TITLE}\",\"description\":${SUB_DESC_JSON},\"parentId\":\"${ISSUE_UUID}\",\"status\":\"todo\",\"priority\":\"medium\"}" > /dev/null 2>&1 || true
-
-                      echo "  Sub-${IDX}: ${ITEM_CLEAN}"
-                      IDX=$((IDX + 1))
-                    fi
-                  done
-
-                  STATUS="done"
-                  COMMENT="📊 분석 완료 — 자동 머지됨\n\n"
-                  COMMENT="${COMMENT}🎉 PR 머지: ${PR_URL}\n\n"
-                  COMMENT="${COMMENT}📋 ${SUB_COUNT}개 항목으로 분할하여 sub-이슈를 생성했습니다.\n"
-                  COMMENT="${COMMENT}각 sub-이슈가 순차적으로 실행되며, 완료 시 승인을 요청합니다.\n\n"
-                  COMMENT="${COMMENT}📂 분석 파일: ${ANALYSIS_FILE}"
-                else
-                  STATUS="done"
-                  COMMENT="📊 분석 완료 — 자동 머지됨\n\n"
-                  COMMENT="${COMMENT}🎉 PR 머지: ${PR_URL}\n\n"
-                  COMMENT="${COMMENT}📂 분석 파일: ${ANALYSIS_FILE}\n\n"
-                  COMMENT="${COMMENT}💡 항목 자동 추출 불가 — 분석 결과를 확인하고 후속 이슈를 생성해주세요."
-                fi
-              else
-                STATUS="in_review"
-                COMMENT="📊 분석 완료 — PR 생성 실패 (수동 확인 필요)\n\n🔗 Actions 로그: ${RUN_URL}"
-              fi
-            else
-              # 코드 수정 작업
-              # parent_id가 없고, 설명에 ANALYSIS 참조가 있으며,
-              # 현재 issue_id가 ANALYSIS 원본 ID와 일치할 때만 → sub-이슈 자동 분할
-              DESC_TEXT=$(echo "$TASK" | sed 's/^.*\. 상세: //')
-              ANALYSIS_REF=$(echo "$DESC_TEXT" | grep -oP 'docs/ANALYSIS-[A-Z]+-\d+\.md' | head -1 || echo "")
-              HAS_PARENT="${{ github.event.client_payload.parent_id || '' }}"
-
-              # WHY: 이중 가드 — ANALYSIS-HSD-13.md는 HSD-13만 분할 가능, HSD-23이 참조해도 차단
-              ANALYSIS_OWNER_ID=""
-              if [ -n "$ANALYSIS_REF" ]; then
-                ANALYSIS_OWNER_ID=$(echo "$ANALYSIS_REF" | grep -oP 'ANALYSIS-\K[A-Z]+-\d+' || echo "")
-              fi
-
-              if [ -n "$ANALYSIS_REF" ] && [ -z "$HAS_PARENT" ] && [ -f "$ANALYSIS_REF" ] && [ "$ANALYSIS_OWNER_ID" = "$ISSUE_ID" ]; then
-                # ANALYSIS 파일에서 항목 추출
-                SUB_ITEMS=$(grep -P '^\s*-\s*\[\s*\]\s*\*\*' "$ANALYSIS_REF" | head -15 || echo "")
-                SUB_COUNT=$(echo "$SUB_ITEMS" | grep -c '\*\*' || echo 0)
-
-                REPO_BRANCH_TAG="[$(echo "${{ github.repository }}" | cut -d/ -f2):${BRANCH}]"
-
-                if [ "$SUB_COUNT" -gt 1 ]; then
-                  # 항목 2개 이상 → sub-이슈 자동 생성 + 자동 머지 (현재 작업은 1개만 처리했으므로)
-                  PR_URL=$(gh pr create \
-                    --base "$BRANCH" \
-                    --head "$WORK_BRANCH" \
-                    --title "[${ISSUE_ID}] 코드 수정 (항목1)" \
-                    --body "ANALYSIS 기반 순차 수정 - 항목 1" \
-                    2>&1) || true
-
-                  if echo "$PR_URL" | grep -q "github.com"; then
-                    PR_NUM=$(echo "$PR_URL" | grep -oP '\d+$')
-                    # WHY: 병렬 실행 시 merge conflict — auto-rebase 시도
-                    for attempt in 1 2 3; do
-                      gh pr merge "$PR_NUM" --merge --delete-branch 2>&1 && break
-                      echo "⚠️ Merge 실패 (${attempt}/3) — rebase 시도"
-                      git fetch origin "$BRANCH" 2>/dev/null
-                      git checkout "$WORK_BRANCH" 2>/dev/null
-                      # WHY: .gitignore 수정 잔재 등 unstaged changes가 rebase를 막음 (HSD-330 사고)
-                      git stash 2>/dev/null || true
-                      if git rebase "origin/${BRANCH}" 2>&1; then
-                        git push origin "$WORK_BRANCH" --force-with-lease 2>&1 || true
-                        sleep 3
-                      else
-                        git rebase --abort 2>/dev/null; break
-                      fi
-                    done
-                  fi
-
-                  # 나머지 항목으로 sub-이슈 생성 (2번째부터)
-                  echo "📋 ANALYSIS에서 ${SUB_COUNT}개 항목 발견 — 나머지 sub-이슈 생성"
-
-                  # WHY: 멱등성 — 같은 parent 하위 기존 이슈 제목 목록 조회
-                  EXISTING_TITLES=$(curl -sf "${PAPERCLIP_URL}/api/companies/b80076db-214e-44a4-b016-427d7f0e3044/issues" \
-                    -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" 2>/dev/null \
-                    | jq -r "[.[] | select(.parentId == \"${ISSUE_UUID}\")] | .[].title" 2>/dev/null || echo "")
-
-                  IDX=1
-                  echo "$SUB_ITEMS" | while IFS= read -r item; do
-                    if [ "$IDX" -gt 1 ]; then
-                      ITEM_CLEAN=$(echo "$item" | sed 's/^\s*-\s*\[\s*\]\s*\*\*//' | sed 's/\*\*\s*$//' | sed 's/^\s*//' | head -c 120)
-                      if [ -n "$ITEM_CLEAN" ]; then
-                        SUB_TITLE="${REPO_BRANCH_TAG} ${ITEM_CLEAN}"
-
-                        # 중복 차단
-                        if echo "$EXISTING_TITLES" | grep -qF "$SUB_TITLE"; then
-                          echo "  ⏭ Sub-${IDX}: 중복 — 스킵 (${ITEM_CLEAN})"
-                          IDX=$((IDX + 1))
-                          continue
-                        fi
-
-                        SUB_DESC="상위 이슈: ${ISSUE_ID}\n참조: ${ANALYSIS_REF}\n\n${ITEM_CLEAN}"
-                        SUB_DESC_JSON=$(echo -e "$SUB_DESC" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null || echo "\"\"")
-
-                        curl -sf -X POST "${PAPERCLIP_URL}/api/companies/b80076db-214e-44a4-b016-427d7f0e3044/issues" \
-                          -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
-                          -H "Content-Type: application/json" \
-                          -d "{\"title\":\"${SUB_TITLE}\",\"description\":${SUB_DESC_JSON},\"parentId\":\"${ISSUE_UUID}\",\"status\":\"todo\",\"priority\":\"medium\"}" > /dev/null 2>&1 || true
-                        echo "  Sub-${IDX}: ${ITEM_CLEAN}"
-                      fi
-                    fi
-                    IDX=$((IDX + 1))
-                  done
-
-                  STATUS="done"
-                  COMMENT="✅ 항목1 수정 완료 + 자동 머지\n\n"
-                  COMMENT="${COMMENT}🎉 PR: ${PR_URL}\n\n"
-                  COMMENT="${COMMENT}📋 나머지 $((SUB_COUNT - 1))개 항목을 sub-이슈로 생성했습니다.\n"
-                  COMMENT="${COMMENT}각 sub-이슈가 순차적으로 실행됩니다."
-                else
-                  # 항목 1개 또는 추출 불가 → 기존 방식 (in_review, 승인 대기)
-                  STATUS="in_review"
-                  COMMENT="✅ 코드 수정 완료 — 리뷰 대기 중\n\n"
-                  COMMENT="${COMMENT}📌 브랜치: \`${WORK_BRANCH}\` → \`${BRANCH}\`\n\n"
-                  COMMENT="${COMMENT}📝 커밋:\n\`\`\`\n${COMMIT_LOG}\n\`\`\`\n\n"
-                  COMMENT="${COMMENT}📂 변경 파일:\n\`\`\`\n${CHANGED_FILES}\n\`\`\`\n\n"
-                  COMMENT="${COMMENT}🔗 Actions 로그: ${RUN_URL}\n\n"
-                  COMMENT="${COMMENT}👉 반영하려면 이 이슈에 본문 내용 없이 '승인' 이라고만 코멘트를 남겨주세요."
-                fi
-              else
-                # ANALYSIS 참조 없음 또는 sub-이슈 → 자동 PR 생성 + merge 시도
-                PR_URL=$(gh pr create \
-                  --base "$BRANCH" \
-                  --head "$WORK_BRANCH" \
-                  --title "[${ISSUE_ID}] 코드 수정" \
-                  --body "Paperclip 이슈 ${ISSUE_ID} 자동 생성 PR" \
-                  2>&1) || true
-
-                if echo "$PR_URL" | grep -q "github.com"; then
-                  PR_NUM=$(echo "$PR_URL" | grep -oP '\d+$')
-
-                  # WHY: 병렬 실행 시 merge conflict 발생 가능 — auto-rebase로 자동 복구
-                  MERGE_OK=false
-                  for attempt in 1 2 3; do
-                    if gh pr merge "$PR_NUM" --merge --delete-branch 2>&1; then
-                      MERGE_OK=true
-                      break
-                    fi
-                    echo "⚠️ Merge 실패 (${attempt}/3) — rebase 시도"
-                    git fetch origin "$BRANCH" 2>/dev/null
-                    git checkout "$WORK_BRANCH" 2>/dev/null
-                    if git rebase "origin/${BRANCH}" 2>&1; then
-                      git push origin "$WORK_BRANCH" --force-with-lease 2>&1 || true
-                      sleep 3
-                    else
-                      git rebase --abort 2>/dev/null
-                      echo "❌ Rebase 불가 — 수동 해결 필요"
-                      break
-                    fi
-                  done
-
-                  if [ "$MERGE_OK" = true ]; then
-                    STATUS="done"
-                    COMMENT="✅ 코드 수정 완료 — 자동 머지됨\n\n"
-                    COMMENT="${COMMENT}🎉 PR: ${PR_URL}\n\n"
-                    COMMENT="${COMMENT}📂 변경 파일:\n\`\`\`\n${CHANGED_FILES}\n\`\`\`"
-                  else
-                    STATUS="in_review"
-                    COMMENT="✅ 코드 수정 완료 — merge conflict 발생, 수동 확인 필요\n\n"
-                    COMMENT="${COMMENT}📌 브랜치: \`${WORK_BRANCH}\` → \`${BRANCH}\`\n\n"
-                    COMMENT="${COMMENT}🔗 Actions 로그: ${RUN_URL}\n\n"
-                    COMMENT="${COMMENT}👉 conflict 해결 후 '승인' 코멘트를 남겨주세요."
-                  fi
-                else
-                  STATUS="in_review"
-                  COMMENT="✅ 코드 수정 완료 — PR 생성 실패\n\n"
-                  COMMENT="${COMMENT}📌 브랜치: \`${WORK_BRANCH}\` → \`${BRANCH}\`\n\n"
-                  COMMENT="${COMMENT}🔗 Actions 로그: ${RUN_URL}"
-                fi
-              fi
-            fi
-          elif [ "$HAS_CHANGES" = "true" ] && [ "$PUSH_SUCCESS" != "true" ]; then
-            # Push 실패는 재시도하면 성공할 수 있으므로 todo 복귀 (네트워크 등 일시 문제)
-            STATUS="todo"
-            COMMENT="❌ Git Push 3회 실패 — 자동 재시도 예정\n\n"
-            COMMENT="${COMMENT}Claude는 파일 수정을 완료했지만 push에 실패했습니다.\n\n"
-            COMMENT="${COMMENT}🔗 Actions 로그: ${RUN_URL}"
-          elif [ "$CLAUDE_STATUS" = "failed" ]; then
-            # WHY: max_turns/token_limit 같은 결정적 실패 — 재시도해도 똑같이 실패
-            # in_review로 보고하여 사람 검토 필요
-            STATUS="in_review"
-            COMMENT="⚠️ Claude 실행 실패 — 자동 재시도 차단 (수동 검토 필요)\n\n"
-            COMMENT="${COMMENT}max_turns 초과 / context limit 등 결정적 에러일 가능성.\n"
-            COMMENT="${COMMENT}작업을 더 작은 단위로 분할하거나 max_turns를 늘려야 합니다.\n\n"
-            COMMENT="${COMMENT}🔗 Actions 로그: ${RUN_URL}\n\n"
-            COMMENT="${COMMENT}👉 검토 후 다시 시도하려면 이 이슈를 todo로 변경해주세요."
-          elif [ "$HAS_CHANGES" != "true" ]; then
-            # Claude 성공했지만 변경사항 없음 — 작업 내용 확인 필요 (in_review)
-            STATUS="in_review"
-            COMMENT="⚠️ Claude 실행 완료 — 변경사항 없음\n\n"
-            COMMENT="${COMMENT}파일이 수정되지 않았습니다. 작업 내용/범위를 확인해주세요.\n\n"
-            COMMENT="${COMMENT}🔗 Actions 로그: ${RUN_URL}"
-          else
-            STATUS="todo"
-            COMMENT="❌ 작업 실패 — 재시도 필요\n\n🔗 Actions 로그: ${RUN_URL}"
-          fi
-
-          # 상태 업데이트
-          curl -sf -X PATCH "${PAPERCLIP_URL}/api/issues/${ISSUE_UUID}" \
-            -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d "{\"status\":\"${STATUS}\"}" > /dev/null 2>&1 || true
-
-          # 코멘트
-          COMMENT_ESCAPED=$(echo -e "$COMMENT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
-          curl -sf -X POST "${PAPERCLIP_URL}/api/issues/${ISSUE_UUID}/comments" \
-            -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d "{\"body\":${COMMENT_ESCAPED}}" > /dev/null 2>&1 || true
-
-          echo "Paperclip ${ISSUE_ID}: ${STATUS} (분석: ${IS_ANALYSIS})"
-
-  # ── 승인 → PR 생성 + 머지 (claude-approve) ──
-  approve:
-    if: github.event_name == 'repository_dispatch' && github.event.client_payload.action == 'approve'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-      pull-requests: write
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.client_payload.branch || 'main' }}
-          fetch-depth: 0
-
-      - name: PR 생성 및 머지
-        env:
-          PAPERCLIP_URL: https://paperclip-production-7ed4.up.railway.app
-          PAPERCLIP_API_KEY: ${{ secrets.PAPERCLIP_API_KEY }}
-          ISSUE_UUID: ${{ github.event.client_payload.issue_uuid }}
-          ISSUE_ID: ${{ github.event.client_payload.issue_id }}
-          ISSUE_TITLE: ${{ github.event.client_payload.issue_title }}
-          BRANCH: ${{ github.event.client_payload.branch || 'main' }}
-          GH_TOKEN: ${{ secrets.GLOBAL_SETTINGS_TOKEN }}
-        run: |
-          WORK_BRANCH="claude/${ISSUE_ID}"
-
-          # PR 생성
+          TITLE=$(echo "$TASK" | sed 's/\. 상세:.*$//' | head -c 72)
           PR_URL=$(gh pr create \
             --base "$BRANCH" \
             --head "$WORK_BRANCH" \
-            --title "[${ISSUE_ID}] ${ISSUE_TITLE}" \
-            --body "Paperclip 이슈 ${ISSUE_ID} 승인됨. 자동 생성된 PR." \
-            2>&1) || true
+            --title "[${ISSUE_ID}] ${TITLE}" \
+            --body "자동 생성 PR — 검토 후 머지해주세요.
+
+          작업: ${TASK}
+          🔗 Actions 로그: ${RUN_URL}" 2>&1) || true
 
           if echo "$PR_URL" | grep -q "github.com"; then
-            echo "PR 생성됨: $PR_URL"
-
-            # PR 자동 머지
-            PR_NUM=$(echo "$PR_URL" | grep -oP '\d+$')
-            gh pr merge "$PR_NUM" --merge --delete-branch || true
-
-            # Paperclip → done
-            curl -sf -X PATCH "${PAPERCLIP_URL}/api/issues/${ISSUE_UUID}" \
-              -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
-              -H "Content-Type: application/json" \
-              -d '{"status":"done"}' > /dev/null 2>&1 || true
-
-            curl -sf -X POST "${PAPERCLIP_URL}/api/issues/${ISSUE_UUID}/comments" \
-              -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
-              -H "Content-Type: application/json" \
-              -d "{\"body\":\"🎉 PR 머지 완료: ${PR_URL}\"}" > /dev/null 2>&1 || true
-
-            echo "✅ PR 머지 + Paperclip done"
+            echo "✅ PR 생성됨: $PR_URL"
           else
             echo "⚠️ PR 생성 실패: $PR_URL"
-
-            curl -sf -X POST "${PAPERCLIP_URL}/api/issues/${ISSUE_UUID}/comments" \
-              -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
-              -H "Content-Type: application/json" \
-              -d "{\"body\":\"⚠️ PR 생성 실패 — 브랜치 ${WORK_BRANCH} 확인 필요\"}" > /dev/null 2>&1 || true
+            echo "브랜치 ${WORK_BRANCH}가 push되었으니 수동으로 PR을 생성하세요."
           fi

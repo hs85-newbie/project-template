@@ -21,7 +21,6 @@ GitHub에서 이 레포의 **"Use this template"** 버튼 클릭 → 레포명 �
 | Secret | 등록 위치 | 값 |
 |---|---|---|
 | `GLOBAL_SETTINGS_TOKEN` | 레포 Settings → Secrets → Actions | GitHub PAT (repo 스코프) |
-| `PAPERCLIP_API_KEY` | 레포 Settings → Secrets → Actions | Paperclip Board API 키 |
 
 ### 3단계: CLAUDE.md 수정
 
@@ -52,36 +51,23 @@ GitHub에서 이 레포의 **"Use this template"** 버튼 클릭 → 레포명 �
 @claude 로그인 기능 구현해줘
 ```
 
-### 방법 2: Paperclip 이슈 (자동 파이프라인)
-Paperclip 대시보드에서 이슈 생성:
+### 방법 2: 수동 디스패치 (Actions UI)
+레포 **Actions → "Claude Code (수동 실행)" → Run workflow** 에서 `task` 입력:
 ```
-제목: [레포명:브랜치] 작업 내용
-설명: 상세 요구사항
-```
-
-예시:
-```
-[my-project:dev] 사용자 인증 API 구현
-[my-project] README 업데이트
+[기능] 사용자 인증 API 구현
+[정리] 미사용 import 제거
 ```
 
-### Paperclip 파이프라인 흐름
+### 디스패치 흐름
 
 ```
-이슈 등록 (todo)
-  ↓ 30분 내 자동 감지
-in_progress + 🚀 코멘트
+task 입력 (workflow_dispatch / repository_dispatch)
+  ↓ 작업 유형 자동 판단 (분석=opus / 정리=haiku / 일반=sonnet)
+Claude 코드 수정 → claude/<id>-<timestamp> 브랜치 push
   ↓
-Claude 코드 수정 → 브랜치 push
-  ↓
-in_review + 📝 보고서 코멘트
-  (변경 파일, 커밋 내용 확인)
-  ↓
-"승인" 코멘트
-  ↓ 30분 내 자동 감지
-PR 자동 생성 + 머지
-  ↓
-done + 🎉 PR 머지 완료 코멘트
+PR 자동 생성 (검토 대기)
+  ↓ 사람이 확인 후 머지  ← 머지는 사람 확인 게이트
+완료
 ```
 
 ---
@@ -92,7 +78,7 @@ done + 🎉 PR 머지 완료 코멘트
 |---|---|---|
 | `claude.yml` | `@claude` 댓글 | Claude Code 즉시 실행 |
 | `claude-code-review.yml` | PR 생성/업데이트 | 자동 코드 리뷰 |
-| `claude-dispatch.yml` | 수동 UI / Paperclip dispatch | 태스크 기반 실행 + 승인 후 PR 머지 |
+| `claude-dispatch.yml` | 수동 UI / `repository_dispatch` | 태스크 기반 실행 + PR 자동 생성 (머지는 사람 확인) |
 | `ci-quality-gate.yml` | `src/`, `package.json` 변경 시 | TypeScript · ESLint · 테스트 · 커버리지 80% |
 | `dependabot.yml` | 매주 월요일 KST 09:00 | npm · Actions 의존성 자동 업데이트 |
 
@@ -115,7 +101,7 @@ done + 🎉 PR 머지 완료 코멘트
 
 - **dev**: 모든 코드 수정은 dev 브랜치에 반영
 - **main**: 전체 점검 통과 후에만 dev → main 머지
-- Paperclip 이슈에 `[레포:dev]`로 지정하면 dev 브랜치 대상으로 실행
+- 디스패치 시 `branch` payload(또는 기본 `main`)로 대상 브랜치 지정
 
 ---
 
@@ -130,6 +116,6 @@ project-template/
 │   └── workflows/
 │       ├── claude.yml                 # @claude 댓글 트리거
 │       ├── claude-code-review.yml     # PR 자동 리뷰
-│       ├── claude-dispatch.yml        # Paperclip dispatch + 승인 PR
+│       ├── claude-dispatch.yml        # 수동/dispatch 실행 + PR 생성
 │       └── ci-quality-gate.yml        # CI 품질 게이트
 ```
